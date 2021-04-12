@@ -24,6 +24,8 @@ pillow == 7.0.0
 
 Since the authors of FERNet haven't open source the UWD dataset, we use dataset UTDAC2020, the download link of which is shown as follows.
 
+https://drive.google.com/file/d/1avyB-ht3VxNERHpAwNTuBRFOxiXDMczI/view?usp=sharing
+
 It is recommended to symlink the dataset file to the root.
 
 ```
