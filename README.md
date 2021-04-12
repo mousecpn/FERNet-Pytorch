@@ -59,7 +59,7 @@ Since the official paper omits lots of details of the implementation, I decide t
 - Instead of directly input offset ($\Delta x, \Delta y$) to DCN, I use a FC layer to process the offset, which seems to obtain higher performance.
 - Since mmdetection have no implementation of randomly warming up, I still follow the pre-defined schedule_2x setting in mmdetection.
 
-### SOME THING TO SAY ABOUT THE EXPERIMENTS
+### SOMETHING TO SAY ABOUT THE EXPERIMENTS
 
 - Although I only train the model for 24 epochs, it seems that neither of PRS and CCB improves performance. Thus, I need your help to point out the mistake of my implementation and assist me to improve the this implementation. If the author of the paper can see this repository, please open source the code as soon as possible. 
 - In PRS, if you use the feature of after the pre-processing phase ($X_{end}$) for DCN, the performance is much lower than just using $X_{out}$. 
