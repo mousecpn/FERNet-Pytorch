@@ -6,7 +6,7 @@
 
 This implementation is based on [mmdetection](https://github.com/open-mmlab/mmdetection).
 
-Follow the installation of [mmdetection](https://github.com/open-mmlab/mmdetection), and copy the code in this repository in the [mmdetection](https://github.com/open-mmlab/mmdetection) file.
+Follow the installation of [mmdetection](https://github.com/open-mmlab/mmdetection), and copy the code of this repository to the [mmdetection](https://github.com/open-mmlab/mmdetection) file.
 
 ### ENVIRONMENT
 
