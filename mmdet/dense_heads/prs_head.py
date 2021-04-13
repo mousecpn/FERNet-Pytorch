@@ -275,6 +275,7 @@ class PRSHead(AnchorHead):
             h = h / img_h * featmap_size[1]
             w = w.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1)
             h = h.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1)
+            dxy = bbox_pred.permute(0, 2, 3, 1)
             dxy = bbox_pred.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 4)[:, :, :, :, :2]
             off_x = dxy[:, :, :, :, 0].view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1) * w * 0.1
             off_y = dxy[:, :, :, :, 1].view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1) * h * 0.1
