@@ -7,9 +7,11 @@ from mmcv.runner import load_checkpoint
 from mmdet.utils import get_root_logger
 from ..builder import BACKBONES
 from .resnet import ResNet
+from mmcv.runner import BaseModule
+import warnings
 
 @BACKBONES.register_module()
-class CCB(VGG):
+class CCB(VGG, BaseModule):
     """VGG Backbone network for single-shot-detection.
 
     Args:
@@ -42,15 +44,9 @@ class CCB(VGG):
                  ceil_mode=True,
                  out_indices=(3, 4),
                  out_feature_indices=(22, 34),
-                 l2_norm_scale=20.,
-                 assist= dict(depth=50,
-                 num_stages=4,
-                 out_indices=(0, 1, 2, 3),
-                 frozen_stages=1,
-                 norm_cfg=dict(type='BN', requires_grad=True),
-                 norm_eval=True,
-                 style='pytorch')
-                 ):
+                 pretrained=None,
+                 init_cfg=None,
+                 l2_norm_scale=20.):
         # TODO: in_channels for mmcv.VGG
         super(CCB, self).__init__(
             depth,
@@ -62,7 +58,7 @@ class CCB(VGG):
 
         self.features.add_module(
             str(len(self.features)),
-            nn.MaxPool2d(kernel_size=3, stride=1, padding=1) )
+            RFAM(512, 0.1) )
         self.features.add_module(
             str(len(self.features)),
             nn.Conv2d(512, 1024, kernel_size=3, padding=6, dilation=6))
@@ -80,11 +76,27 @@ class CCB(VGG):
             self.features[out_feature_indices[0] - 1].out_channels,
             l2_norm_scale)
 
-        self.resnet50 = ResNet(depth = assist['depth'], num_stages=assist['num_stages'], out_indices=assist['out_indices'], frozen_stages=assist['frozen_stages'], norm_cfg=assist['norm_cfg'], norm_eval=assist['norm_eval'], style=assist['style'])
 
-        self.chaAdj = nn.Sequential(nn.Conv2d(128, 64, kernel_size=1), nn.Conv2d(512, 256, kernel_size=1), nn.Conv2d(1024, 512, kernel_size=1))
+        self.resnet50 = ResNet(depth=50, init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50'))
+
+        if init_cfg is not None:
+            self.init_cfg = init_cfg
+        elif isinstance(pretrained, str):
+            warnings.warn('DeprecationWarning: pretrained is deprecated, '
+                          'please use "init_cfg" instead')
+            self.init_cfg = dict(type='Pretrained', checkpoint=pretrained)
+        elif pretrained is None:
+            self.init_cfg = [
+                dict(type='Kaiming', layer='Conv2d'),
+                dict(type='Constant', val=1, layer='BatchNorm2d'),
+                dict(type='Normal', std=0.01, layer='Linear'),
+            ]
+        else:
+            raise TypeError('pretrained must be a str or None')
+
+        self.chaAdj = nn.Sequential(nn.Conv2d(128, 64, kernel_size=1), nn.Conv2d(384, 128, kernel_size=1), nn.Conv2d(768, 256, kernel_size=1))
         self.RFAM_PRO = RFAM_PRO(512, 0.1)
-        self.RFAMs = nn.Sequential(RFAM(512, 0.1), RFAM(1024, 0.1), RFAM(512, 0.1))
+        self.RFAMs = nn.Sequential( RFAM(512, 0.1), RFAM(1024, 0.1), RFAM(512, 0.1))
 
 
     def init_weights(self, pretrained=None):
@@ -113,12 +125,7 @@ class CCB(VGG):
             if isinstance(m, nn.Conv2d):
                 xavier_init(m, distribution='uniform')
         constant_init(self.l2_norm, self.l2_norm.scale)
-
-        for m in self.chaAdj.modules():
-            if isinstance(m, nn.Conv2d):
-                xavier_init(m, distribution='uniform')
-
-        self.resnet50.init_weights('torchvision://resnet50')
+        # self.resnet50.init_weights('torchvision://resnet50')
 
 
     def forward(self, x):
@@ -135,14 +142,11 @@ class CCB(VGG):
         resnet_feat.append(feat)
         feat = self.resnet50.layer2(feat)
         resnet_feat.append(feat)
-        hh = self.resnet50(x)
-
         count = 0
         rfam_count = 0
         for i, layer in enumerate(self.features):
             x = layer(x)
-            # if type(layer) == nn.MaxPool2d and count < 3:
-            if count < 3 and resnet_feat[count].shape[1] == x.shape[1] and resnet_feat[count].shape[-1] == x.shape[-1]:
+            if type(layer) == nn.MaxPool2d and count < 3:
                 x = torch.cat((x,resnet_feat[count]), dim=1)
                 x = self.chaAdj[count](x)
                 count += 1
@@ -244,43 +248,16 @@ class L2Norm(nn.Module):
 #         x = self.relu(x)
 #         return x
 
-class BasicConv(nn.Module):
-
-    def __init__(self, in_planes, out_planes, kernel_size, stride=1, padding=0, dilation=1, groups=1, relu=True, bn=True, bias=False):
-        super(BasicConv, self).__init__()
-        self.out_channels = out_planes
-        self.conv = nn.Conv2d(in_planes, out_planes, kernel_size=kernel_size, stride=stride, padding=padding, dilation=dilation, groups=groups, bias=bias)
-        self.bn = nn.BatchNorm2d(out_planes,eps=1e-5, momentum=0.01, affine=True) if bn else None
-        self.relu = nn.ReLU(inplace=True) if relu else None
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                kaiming_init(m)
-            elif isinstance(m, nn.BatchNorm2d):
-                constant_init(m, 1)
-            elif isinstance(m, nn.Linear):
-                normal_init(m, std=0.01)
-
-    def forward(self, x):
-        x = self.conv(x)
-        if self.bn is not None:
-            x = self.bn(x)
-        if self.relu is not None:
-            x = self.relu(x)
-        return x
-
 class RFAM(nn.Module):
-    def __init__(self, indim, scale=0.1):
+    def __init__(self, indim, scale):
         super(RFAM, self).__init__()
         embdim = indim//4
-        self.branch1 = nn.Sequential(BasicConv(indim, embdim, kernel_size=1), BasicConv(embdim, embdim, kernel_size=3, padding=1, relu=False))
-        self.branch2 = nn.Sequential(BasicConv(indim, embdim, kernel_size=1),
-                                     BasicConv(embdim, embdim, kernel_size=3, padding=1),
-                                     BasicConv(embdim, embdim, kernel_size=5, dilation=3, padding=6, relu=False))
-        self.branch3 = nn.Sequential(BasicConv(indim, embdim, kernel_size=1),
-                                     BasicConv(embdim, embdim, kernel_size=5, padding=3),
-                                     BasicConv(embdim, embdim, kernel_size=3, dilation=5, padding=4, relu=False))
-        self.conv = BasicConv(3*embdim, indim, kernel_size = 1, relu=False)
+        self.branch1 = nn.Sequential(nn.Conv2d(indim, embdim, kernel_size=1), nn.Conv2d(embdim, embdim, kernel_size=3, padding=1))
+        self.branch2 = nn.Sequential(nn.Conv2d(indim, embdim, kernel_size=1), nn.Conv2d(embdim, embdim, kernel_size=3, padding=1), nn.Conv2d(embdim, embdim, kernel_size=5, dilation=3, padding=6))
+        self.branch3 = nn.Sequential(nn.Conv2d(indim, embdim, kernel_size=1),
+                                     nn.Conv2d(embdim, embdim, kernel_size=5, padding=3),
+                                     nn.Conv2d(embdim, embdim, kernel_size=3, dilation=5, padding=4))
+        self.conv = nn.Conv2d(3*embdim, indim, kernel_size = 1)
         self.relu = nn.ReLU()
         self.scale = scale
 
@@ -295,25 +272,24 @@ class RFAM(nn.Module):
         return x
 
 class RFAM_PRO(nn.Module):
-    def __init__(self, indim, scale=0.1):
+    def __init__(self, indim, scale):
         super(RFAM_PRO, self).__init__()
         embdim = indim // 4
-        self.branch1 = nn.Sequential(BasicConv(indim, embdim, kernel_size=1),
-                                     BasicConv(embdim, embdim, kernel_size=3, padding=1, relu=False))
-        self.branch2 = nn.Sequential(BasicConv(indim, embdim, kernel_size=1),
-                                     BasicConv(embdim, embdim, kernel_size=(3, 1), padding =(1, 0)),
-                                     BasicConv(embdim, embdim, kernel_size=3, dilation=3, padding=3, relu=False))
-        self.branch3 = nn.Sequential(BasicConv(indim, embdim, kernel_size=1),
-                                     BasicConv(embdim, embdim, kernel_size=(1, 3), padding =(0, 1)),
-                                     BasicConv(embdim, embdim, kernel_size=3, dilation=3, padding=3, relu=False))
-        self.branch4 = nn.Sequential(BasicConv(indim, embdim, kernel_size=1),
-                                     BasicConv(embdim, embdim, kernel_size=(1, 3), padding =(0, 1)),
-                                     BasicConv(embdim, embdim, kernel_size=(3, 1), padding =(1, 0)),
-                                     BasicConv(embdim, embdim, kernel_size=3, dilation=5, padding=5, relu=False))
-        self.conv = BasicConv(4 * embdim, indim, kernel_size=1, relu=False)
+        self.branch1 = nn.Sequential(nn.Conv2d(indim, embdim, kernel_size=1),
+                                     nn.Conv2d(embdim, embdim, kernel_size=3, padding=1))
+        self.branch2 = nn.Sequential(nn.Conv2d(indim, embdim, kernel_size=1),
+                                     nn.Conv2d(embdim, embdim, kernel_size=(3,1), padding=(1,0)),
+                                     nn.Conv2d(embdim, embdim, kernel_size=3, dilation=3, padding=3))
+        self.branch3 = nn.Sequential(nn.Conv2d(indim, embdim, kernel_size=1),
+                                     nn.Conv2d(embdim, embdim, kernel_size=(1,3), padding=(0,1)),
+                                     nn.Conv2d(embdim, embdim, kernel_size=3, dilation=3, padding=3))
+        self.branch4 = nn.Sequential(nn.Conv2d(indim, embdim, kernel_size=1),
+                                     nn.Conv2d(embdim, embdim, kernel_size=(1,3), padding=(0,1)),
+                                     nn.Conv2d(embdim, embdim, kernel_size=(3, 1), padding=(1, 0)),
+                                     nn.Conv2d(embdim, embdim, kernel_size=3, dilation=5, padding=5))
+        self.conv = nn.Conv2d(4 * embdim, indim, kernel_size=1)
         self.relu = nn.ReLU()
         self.scale = scale
-
 
     def forward(self, x):
         x1 = self.branch1(x)

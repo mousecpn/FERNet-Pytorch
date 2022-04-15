@@ -2,37 +2,89 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmcv.cnn import xavier_init
-import cv2
-from torchvision.utils import save_image
-import numpy as np
-from ..builder import HEADS
+from mmcv.runner import force_fp32
+
+from mmdet.core import (build_anchor_generator, build_assigner,
+                        build_bbox_coder, build_sampler, multi_apply)
+from ..builder import HEADS, build_loss
 from ..losses import smooth_l1_loss
 from .anchor_head import AnchorHead
 from mmcv.ops import DeformConv2d
-from mmdet.core import (anchor_inside_flags, build_anchor_generator,
-                        build_assigner, build_bbox_coder, build_sampler,
-                        force_fp32, images_to_levels, multi_apply,
-                        multiclass_nms, unmap)
+from mmcv.runner import BaseModule
+
+def images_to_levels(target, num_levels):
+    """Convert targets by image to targets by feature level.
+
+    [target_img0, target_img1] -> [target_level0, target_level1, ...]
+    """
+    target = torch.stack(target, 0)
+    level_targets = []
+    start = 0
+    for n in num_levels:
+        end = start + n
+        # level_targets.append(target[:, start:end].squeeze(0))
+        level_targets.append(target[:, start:end])
+        start = end
+    return level_targets
+
+class AdaptiveConv(BaseModule):
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size=3,
+                 stride=1,
+                 padding=1,
+                 dilation=3,
+                 groups=1,
+                 deform_groups=1,
+                 bias=False,
+                 type='offset',
+                 init_cfg=dict(
+                     type='Normal', std=0.01, override=dict(name='conv'))):
+        super(AdaptiveConv, self).__init__(init_cfg)
+        assert type in ['offset', 'dilation']
+        self.adapt_type = type
+
+        assert kernel_size == 3, 'Adaptive conv only supports kernels 3'
+        if self.adapt_type == 'offset':
+            assert stride == 1 and padding == 1, \
+                'Adaptive conv offset mode only supports padding: {1}, ' \
+                f'stride: {1}, groups: {1}'
+            self.conv = DeformConv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=padding,
+                stride=stride,
+                groups=groups,
+                deform_groups=deform_groups,
+                bias=bias)
+        else:
+            self.conv = nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=dilation,
+                dilation=dilation)
+
+    def forward(self, x, offset, num_anchors):
+        """Forward function."""
+        if self.adapt_type == 'offset':
+            N, _, H, W = x.shape
+            assert offset is not None
+            # reshape [N, NA, 18] to (N, 18, H, W)
+            offset = offset.reshape(N, H, W, -1)
+            offset = offset.permute(0, 3, 1, 2)
+            offset = offset.contiguous()
+            x = self.conv(x, offset)
+        else:
+            assert offset is None
+            x = self.conv(x)
+        return x
 
 # TODO: add loss evaluator for SSD
 @HEADS.register_module()
 class PRSHead(AnchorHead):
-    """SSD head used in https://arxiv.org/abs/1512.02325.
-
-    Args:
-        num_classes (int): Number of categories excluding the background
-            category.
-        in_channels (int): Number of channels in the input feature map.
-        anchor_generator (dict): Config dict for anchor generator
-        background_label (int | None): Label ID of background, set as 0 for
-            RPN and num_classes for other heads. It will automatically set as
-            num_classes if None is given.
-        bbox_coder (dict): Config of bounding box coder.
-        reg_decoded_bbox (bool): If true, the regression loss would be
-            applied on decoded bounding boxes. Default: False
-        train_cfg (dict): Training config of anchor head.
-        test_cfg (dict): Testing config of anchor head.
-    """  # noqa: W605
 
     def __init__(self,
                  num_classes=80,
@@ -52,28 +104,38 @@ class PRSHead(AnchorHead):
                  ),
                  reg_decoded_bbox=False,
                  train_cfg=None,
-                 test_cfg=None):
-        super(AnchorHead, self).__init__()
+                 test_cfg=None,
+                 init_cfg=dict(
+                     type='Normal',
+                     layer='Conv2d',
+                     std=0.01,
+                     override=dict(
+                         type='Normal',
+                         name='cls_convs_refine',
+                         std=0.01,
+                         bias_prob=0.01)),
+                 **kwargs):
+        super(AnchorHead, self).__init__(init_cfg, **kwargs)
         self.num_classes = num_classes
         self.in_channels = in_channels
         self.cls_out_channels = num_classes + 1  # add background class
         self.anchor_generator = build_anchor_generator(anchor_generator)
         num_anchors = self.anchor_generator.num_base_anchors
         self.num_anchors = num_anchors
-
+        self.anchor_strides = anchor_generator['strides']
         reg_convs = []
         cls_convs = []
         for i in range(len(in_channels)):
             reg_convs.append(
                 nn.Conv2d(
                     in_channels[i],
-                    num_anchors[i] * 4 ,
+                    num_anchors[i] * 4,
                     kernel_size=3,
                     padding=1))
             cls_convs.append(
                 nn.Conv2d(
                     in_channels[i],
-                    num_anchors[i]* (num_classes + 1),
+                    num_anchors[i],
                     kernel_size=3,
                     padding=1))
         self.reg_convs = nn.ModuleList(reg_convs)
@@ -101,37 +163,28 @@ class PRSHead(AnchorHead):
         self.fp16_enabled = False
 
         # dcn
-        dcn_reg_convs = []
-        dcn_cls_convs = []
+        dcn = []
+        reg_convs_refine = []
+        cls_convs_refine = []
         for i in range(len(in_channels)):
-            dcn_reg_convs.append(
-                DeformConv2d(
-                    in_channels[i]*num_anchors[i],
-                    4*num_anchors[i],
+            dcn.append(AdaptiveConv(num_anchors[i]*in_channels[i], in_channels[i],deform_groups=self.num_anchors[i]))
+            reg_convs_refine.append(
+                nn.Conv2d(
+                    in_channels[i],
+                    num_anchors[i] * 4,
                     kernel_size=3,
-                    bias=True,
-                    padding=3,
-                    groups= num_anchors[i],
-                    deform_groups= num_anchors[i],
-                    dilation = 3
-                ))
-            dcn_cls_convs.append(
-                DeformConv2d(
-                    in_channels[i]*num_anchors[i],
-                    (num_classes + 1)*num_anchors[i],
+                    padding=1))
+            cls_convs_refine.append(
+                nn.Conv2d(
+                    in_channels[i],
+                    num_anchors[i] * self.cls_out_channels,
                     kernel_size=3,
-                    bias=True,
-                    padding=3,
-                    groups= num_anchors[i],
-                    deform_groups= num_anchors[i],
-                    dilation=3
-                ))
-        self.dcn_reg_convs = nn.ModuleList(dcn_reg_convs)
-        self.dcn_cls_convs = nn.ModuleList(dcn_cls_convs)
-        self.BCE = nn.BCEWithLogitsLoss()
-        self.count = 0.0
-        self.total_count = 3230.0*24.0
-        self.offset_transfrom = nn.Linear(2,2)
+                    padding=1))
+        self.dcn = nn.ModuleList(dcn)
+        self.reg_convs_refine = nn.ModuleList(reg_convs_refine)
+        self.cls_convs_refine = nn.ModuleList(cls_convs_refine)
+        self.relu = nn.ReLU(inplace=True)
+        # self.BCE = build_loss(loss_cls_pre)
 
     def init_weights(self):
         """Initialize weights of the head."""
@@ -147,220 +200,79 @@ class PRSHead(AnchorHead):
                       gt_bboxes_ignore=None,
                       proposal_cfg=None,
                       **kwargs):
-        """
-        Args:
-            x (list[Tensor]): Features from FPN.
-            img_metas (list[dict]): Meta information of each image, e.g.,
-                image size, scaling factor, etc.
-            gt_bboxes (Tensor): Ground truth bboxes of the image,
-                shape (num_gts, 4).
-            gt_labels (Tensor): Ground truth labels of each box,
-                shape (num_gts,).
-            gt_bboxes_ignore (Tensor): Ground truth bboxes to be
-                ignored, shape (num_ignored_gts, 4).
-            proposal_cfg (mmcv.Config): Test / postprocessing configuration,
-                if None, test_cfg would be used
+        fg_scores, bbox_preds = self(x)
 
-        Returns:
-            tuple:
-                losses: (dict[str, Tensor]): A dictionary of loss components.
-                proposal_list (list[Tensor]): Proposals of each image.
-        """
-        outs = self(x, img_metas)
+        featmap_sizes = [featmap.size()[-2:] for featmap in fg_scores]
+        assert len(featmap_sizes) == self.anchor_generator.num_levels
+
+        device = fg_scores[0].device
+        anchor_list, valid_flag_list = self.get_anchors(
+            featmap_sizes, img_metas, device=device)
+
         if gt_labels is None:
-            loss_inputs = outs + (gt_bboxes, img_metas)
+            loss_inputs = (anchor_list, valid_flag_list, fg_scores, bbox_preds, gt_bboxes, img_metas)
         else:
-            loss_inputs = outs + (gt_bboxes, gt_labels, img_metas)
-        losses = self.loss(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
+            loss_inputs = (anchor_list, valid_flag_list, fg_scores, bbox_preds, gt_bboxes, gt_labels, img_metas)
+        losses = self.loss_pre(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
+
+        new_feats = []
+
+        # pre-processing
+        for i in range(len(fg_scores)):
+            score = fg_scores[i]
+            s,_ = torch.max(score, dim = 1)
+            s = s.unsqueeze(1)
+            s = F.sigmoid(s)
+            new_feats.append(s*x[i]+x[i])
+        # new_feats = x
+
+        anchor_list_refine = self.refine_bboxes(anchor_list, bbox_preds, img_metas)
+        offset_list = self.anchor_offset(anchor_list_refine, self.anchor_strides, featmap_sizes)
+
+        cls_scores, bbox_preds_refine = self.forward_post(new_feats, offset_list)
+        if gt_labels is None:
+            loss_inputs = (anchor_list_refine, valid_flag_list, cls_scores, bbox_preds_refine, gt_bboxes, img_metas)
+        else:
+            loss_inputs = (anchor_list_refine, valid_flag_list, cls_scores, bbox_preds_refine, gt_bboxes, gt_labels, img_metas)
+        losses_post = self.loss_post(*loss_inputs, gt_bboxes_ignore=gt_bboxes_ignore)
+
+        losses.update(losses_post)
         if proposal_cfg is None:
             return losses
         else:
-            proposal_list = self.get_bboxes(*outs, img_metas, cfg=proposal_cfg)
+            proposal_list = self.get_bboxes(anchor_list_refine, cls_scores, bbox_preds_refine, img_metas, cfg=proposal_cfg)
             return losses, proposal_list
 
-    def cam(self, feature, kernel_size = 1, path='cam.jpg'):
-        weights = torch.mean(feature, dim=(1, 2))
-        cam = torch.matmul(feature.permute(1, 2, 0), weights)
-        cam = F.relu(cam)
-        cam = cam - torch.min(cam)
-        cam = cam / torch.max(cam)
-        cam = 1 - cam
-
-        if kernel_size > 1:
-            cam = cam.reshape((1, 1) + cam.shape)
-            cam = F.max_pool2d(cam, kernel_size, stride=1, padding=(kernel_size - 1) // 2)
-            cam = cam.squeeze()
-        heatmap = cv2.applyColorMap(np.uint8(255 * cam.detach().cpu().numpy()), cv2.COLORMAP_JET)
-        cv2.imwrite(path, heatmap)
-        return cam
-
-    def forward(self, feats, img_metas):
-        """Forward features from the upstream network.
-
-        Args:
-            feats (tuple[Tensor]): Features from the upstream network, each is
-                a 4D-tensor.
-
-        Returns:
-            tuple:
-                cls_scores (list[Tensor]): Classification scores for all scale
-                    levels, each is a 4D-tensor, the channels number is
-                    num_anchors * num_classes.
-                bbox_preds (list[Tensor]): Box energies / deltas for all scale
-                    levels, each is a 4D-tensor, the channels number is
-                    num_anchors * 4.
-        """
+    def forward(self, feats):
         cls_scores = []
         bbox_preds = []
-        new_feats = []
+
         for feat, reg_conv, cls_conv in zip(feats, self.reg_convs,
                                             self.cls_convs):
             cls_scores.append(cls_conv(feat))
             bbox_preds.append(reg_conv(feat))
 
-        # refinement
-        for i in range(len(cls_scores)):
-            score = cls_scores[i]
-            batch_size = score.shape[0]
-            if self.background_label == self.num_classes:
-                score = score.reshape(batch_size,-1, self.num_classes+1,score.shape[-2],score.shape[-1])
-                score = torch.softmax(score,dim=2)
-                score = torch.sum(score[:,:, :-1, :, :],dim=2,keepdim=True)
-                score = score.reshape(batch_size, -1, score.shape[-2],score.shape[-1])
-            else:
-                score = score.reshape(batch_size, -1, self.num_classes + 1, score.shape[-2], score.shape[-1])
-                score = torch.softmax(score, dim=2)
-                score = torch.sum(score[:,:, 1:, :, :],dim=2,keepdim=True)
-                score = score.reshape(batch_size, -1, score.shape[-2], score.shape[-1])
-            # score  = score[:-1]
-            s,_ = torch.max(score, dim = 1)
+        return cls_scores, bbox_preds
 
-            ########################## test #######################################
-            # ori = cv2.imread(img_metas[0]['filename'])
-            # ori = torch.tensor(ori).permute(2,0,1)
-            # im = F.interpolate(ori.unsqueeze(0)/255.0, size=(300, 300), mode="nearest").squeeze(0)
-            # save_image(im, 'sample.jpg')
-            # term = s[0].unsqueeze(0)
-            # term = F.interpolate(term.unsqueeze(0), size=(300,300), mode="nearest").squeeze(0)
-            # self.cam(feats[i][0])
-            # save_image(term,'out.jpg')
-            ########################## test #######################################
-
-
-            s = s.unsqueeze(1)
-            # s = F.sigmoid(s)
-            new_feats.append(s*feats[i] + feats[i])
-
-        featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
-        assert len(featmap_sizes) == self.anchor_generator.num_levels
-
-        device = cls_scores[0].device
-
-        cls_scores_new = []
-        bbox_preds_new = []
-        anchor_list, valid_flag_list = self.get_anchors(
-            featmap_sizes, img_metas, device=device)
-        img_w = img_metas[0]['img_shape'][1]
-        img_h = img_metas[0]['img_shape'][0]
-        self.count += len(feats)
+    def forward_post(self, feats, offset_list):
+        cls_scores = []
+        bbox_preds = []
         for i in range(len(feats)):
-            featmap_size = featmap_sizes[i]
-            anchors = [a[i] for a in anchor_list]
-            anchors = torch.stack(anchors)
-            bbox_pred = bbox_preds[i]
-            w = anchors[:, :, 2] - anchors[:, :, 0]
-            h = anchors[:, :, 3] - anchors[:, :, 1]
+            x = feats[i]
+            shape = list(x.shape)
+            x = x.unsqueeze(1).expand((shape[0],self.num_anchors[i],shape[1],shape[2],shape[3]))
+            shape[1] = shape[1] * self.num_anchors[i]
+            x = x.reshape(shape)
+            offset = offset_list[i]
+            feat = self.relu(self.dcn[i](x, offset, self.num_anchors[i]))
+            cls_score = self.cls_convs_refine[i](feat)
+            bbox_pred = self.reg_convs_refine[i](feat)
+            cls_scores.append(cls_score)
+            bbox_preds.append(bbox_pred)
+        return cls_scores, bbox_preds
 
-            w = w / img_w * featmap_size[0]
-            h = h / img_h * featmap_size[1]
-            w = w.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1)
-            h = h.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1)
-            dxy = bbox_pred.permute(0, 2, 3, 1)
-            dxy = bbox_pred.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 4)[:, :, :, :, :2]
-            off_x = dxy[:, :, :, :, 0].view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1) * w * 0.1
-            off_y = dxy[:, :, :, :, 1].view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1) * h * 0.1
-            offset = torch.cat((off_y, off_x), dim = -1)
-
-            ################### test ##################################################
-            # cx = (anchors[:, :, 2] + anchors[:, :, 0])/2
-            # cy = (anchors[:, :, 3] + anchors[:, :, 1])/2
-            # cx = cx.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1)
-            # cy = cy.view(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 1)
-            # ori_cv = ori.permute(1,2,0).numpy().copy()
-            # ori_cv = cv2.resize(ori_cv, (300, 300))
-            # s = cls_scores[i].reshape(bbox_pred.shape[0], self.num_anchors[i], self.num_classes+1, featmap_size[0], featmap_size[1])
-            # s_max,_ = torch.max(s,dim=2)
-            # for f in range(featmap_size[0]):
-            #     for k in range(featmap_size[1]):
-            #         # for a in range(self.num_anchors[i]):
-            #             # if s[0,a,-1,f,k] == s_max[0,a,f,k]:
-            #             #     www = s[0,a,-1,f,k]
-            #             #     continue
-            #         a = 0
-            #         if k % 4 != 0 or f % 4 != 0:
-            #             continue
-            #         y = int( (f+1) / featmap_size[0] * ori_cv.shape[0])
-            #         x = int( (k+1) / featmap_size[1] * ori_cv.shape[1])
-            #         ox = int( off_x[0,f,k,a,0])
-            #         oy = int( off_y[0,f,k,a,0])
-            #         color = np.random.random(3)*255
-            #         color = (int(color[0]),int(color[1]),int(color[2]))
-            #         cv2.circle(ori_cv, (int(x), int(y)), 1,color , 4)
-            #         ax = cx[0,f,k,a,0]
-            #         ay = cy[0,f,k,a,0]
-            #         wt = w[0,f,k,a,0]
-            #         ht = h[0,f,k,a,0]
-            #         box = [x+ox,y+oy,wt,ht]
-            #         box = xywh2xyxy(box)
-            #         cv2.rectangle(ori_cv, (box[0], box[1]), (box[2], box[3]), color, 2)
-            #         # cv2.circle(ori_cv, (int(x)+ox, int(y)+oy), 1, color, 4)
-            # cv2.imwrite('attention.jpg',ori_cv)
-
-            ################### test ##################################################
-
-
-            offset = offset.unsqueeze(-1).expand(bbox_pred.shape[0], featmap_size[0], featmap_size[1], self.num_anchors[i], 2, 9).permute(0,1,2,3,5,4)
-            offset = self.offset_transfrom(offset.detach())
-
-            offset = offset.reshape(bbox_pred.shape[0], self.num_anchors[i], featmap_size[0], featmap_size[1], 18)
-            offset = offset.permute(0,1,4,2,3).reshape(bbox_pred.shape[0], self.num_anchors[i]*18, featmap_size[0], featmap_size[1]).contiguous()
-            feat = new_feats[i]
-            c = feat.shape[1]
-            feat = feat.permute(1,0,2,3).expand(self.num_anchors[i], c, bbox_pred.shape[0], featmap_size[0], featmap_size[1]).reshape(self.num_anchors[i]*c, bbox_pred.shape[0], featmap_size[0], featmap_size[1])
-            feat = feat.permute(1,0,2,3).contiguous()
-            cls_score_new = self.dcn_cls_convs[i](feat, offset)
-            bbox_pred_new = self.dcn_reg_convs[i](feat, offset)
-            cls_scores_new.append(cls_score_new)
-            bbox_preds_new.append(bbox_pred_new)
-        return [cls_scores_new, cls_scores], [bbox_preds_new, bbox_preds]
-
-
-    def loss_single(self, cls_score, bbox_pred, anchor, labels, label_weights,
+    def loss_single_post(self, cls_score, bbox_pred, anchor, labels, label_weights,
                     bbox_targets, bbox_weights, num_total_samples):
-        """Compute loss of a single image.
-
-        Args:
-            cls_score (Tensor): Box scores for eachimage
-                Has shape (num_total_anchors, num_classes).
-            bbox_pred (Tensor): Box energies / deltas for each image
-                level with shape (num_total_anchors, 4).
-            anchors (Tensor): Box reference for each scale level with shape
-                (num_total_anchors, 4).
-            labels (Tensor): Labels of each anchors with shape
-                (num_total_anchors,).
-            label_weights (Tensor): Label weights of each anchor with shape
-                (num_total_anchors,)
-            bbox_targets (Tensor): BBox regression targets of each anchor wight
-                shape (num_total_anchors, 4).
-            bbox_weights (Tensor): BBox regression loss weights of each anchor
-                with shape (num_total_anchors, 4).
-            num_total_samples (int): If sampling, num total samples equal to
-                the number of total anchors; Otherwise, it is the number of
-                positive anchors.
-
-        Returns:
-            dict[str, Tensor]: A dictionary of loss components.
-        """
         loss_cls_all = F.cross_entropy(
             cls_score, labels, reduction='none') * label_weights
         # FG cat_id: [0, num_classes -1], BG cat_id: num_classes
@@ -376,55 +288,126 @@ class PRSHead(AnchorHead):
         loss_cls_pos = loss_cls_all[pos_inds].sum()
         loss_cls_neg = topk_loss_cls_neg.sum()
         loss_cls = (loss_cls_pos + loss_cls_neg) / num_total_samples
-        # loss_cls = loss_cls[None] * self.count / self.total_count
+
         if self.reg_decoded_bbox:
             bbox_pred = self.bbox_coder.decode(anchor, bbox_pred)
 
         loss_bbox = smooth_l1_loss(
             bbox_pred,
             bbox_targets,
-            bbox_weights,
+            bbox_weights*0.5,
             beta=self.train_cfg.smoothl1_beta,
             avg_factor=num_total_samples)
 
         return loss_cls[None], loss_bbox
 
-    def loss(self,
+    def loss_single_pre(self, fg_scores, bbox_pred, anchor, fg_labels, label_weights,
+                    bbox_targets, bbox_weights, num_total_samples):
+        fg_loss = (F.binary_cross_entropy(
+            F.sigmoid(fg_scores), fg_labels, reduction='none') * label_weights).mean()
+
+
+        if self.reg_decoded_bbox:
+            bbox_pred = self.bbox_coder.decode(anchor, bbox_pred)
+
+        loss_bbox = smooth_l1_loss(
+            bbox_pred,
+            bbox_targets,
+            bbox_weights*0.5,
+            beta=self.train_cfg.smoothl1_beta,
+            avg_factor=num_total_samples)
+
+
+        return fg_loss, loss_bbox
+
+    def loss_pre(self,
+             anchor_list,
+             valid_flag_list,
+             fg_scores,
+             bbox_preds,
+             gt_bboxes,
+             gt_labels,
+             img_metas,
+             gt_bboxes_ignore=None):
+
+        featmap_sizes = [featmap.size()[-2:] for featmap in fg_scores]
+        assert len(featmap_sizes) == self.anchor_generator.num_levels
+
+        # device = fg_scores[0].device
+
+        cls_reg_targets = self.get_targets(
+            anchor_list,
+            valid_flag_list,
+            gt_bboxes,
+            img_metas,
+            gt_bboxes_ignore_list=gt_bboxes_ignore,
+            gt_labels_list=gt_labels,
+            label_channels=1,
+            unmap_outputs=False)
+        if cls_reg_targets is None:
+            return None
+        (labels_list, label_weights_list, bbox_targets_list, bbox_weights_list,
+         num_total_pos, num_total_neg) = cls_reg_targets
+
+        num_images = len(img_metas)
+        all_labels = torch.cat(labels_list, -1).view(num_images, -1)
+        all_label_weights = torch.cat(label_weights_list,
+                                      -1).view(num_images, -1)
+        all_bbox_preds = torch.cat([
+            b.permute(0, 2, 3, 1).reshape(num_images, -1, 4)
+            for b in bbox_preds
+        ], -2)
+        all_bbox_targets = torch.cat(bbox_targets_list,
+                                     -2).view(num_images, -1, 4)
+        all_bbox_weights = torch.cat(bbox_weights_list,
+                                     -2).view(num_images, -1, 4)
+
+        # concat all level anchors to a single tensor
+        all_anchors = []
+        for i in range(num_images):
+            all_anchors.append(torch.cat(anchor_list[i]))
+
+        # check NaN and Inf
+        assert torch.isfinite(all_bbox_preds).all().item(), \
+            'bbox predications become infinite or NaN!'
+
+        fg_labels = all_labels.clone().float()
+        fg_labels[fg_labels != self.num_classes] = 1
+        fg_labels[fg_labels == self.num_classes] = 0
+
+        all_fg_scores = torch.cat([
+            f.permute(0, 2, 3, 1).reshape(
+                num_images, -1) for f in fg_scores
+        ], 1)
+
+
+        fg_losses, losses_bbox = multi_apply(
+            self.loss_single_pre,
+            all_fg_scores,
+            all_bbox_preds,
+            all_anchors,
+            fg_labels,
+            all_label_weights,
+            all_bbox_targets,
+            all_bbox_weights,
+            num_total_samples=num_total_pos)
+        return dict(losses_fg=fg_losses, loss_bbox=losses_bbox)
+
+    def loss_post(self,
+             anchor_list,
+             valid_flag_list,
              cls_scores,
              bbox_preds,
              gt_bboxes,
              gt_labels,
              img_metas,
              gt_bboxes_ignore=None):
-        """Compute losses of the head.
-
-        Args:
-            cls_scores (list[Tensor]): Box scores for each scale level
-                Has shape (N, num_anchors * num_classes, H, W)
-            bbox_preds (list[Tensor]): Box energies / deltas for each scale
-                level with shape (N, num_anchors * 4, H, W)
-            gt_bboxes (list[Tensor]): each item are the truth boxes for each
-                image in [tl_x, tl_y, br_x, br_y] format.
-            gt_labels (list[Tensor]): class indices corresponding to each box
-            img_metas (list[dict]): Meta information of each image, e.g.,
-                image size, scaling factor, etc.
-            gt_bboxes_ignore (None | list[Tensor]): specify which bounding
-                boxes can be ignored when computing the loss.
-
-        Returns:
-            dict[str, Tensor]: A dictionary of loss components.
-        """
-
-        cls_scores_new, cls_scores = cls_scores
-        bbox_preds_new, bbox_preds = bbox_preds
 
         featmap_sizes = [featmap.size()[-2:] for featmap in cls_scores]
         assert len(featmap_sizes) == self.anchor_generator.num_levels
 
-        device = cls_scores[0].device
+        # device = cls_scores[0].device
 
-        anchor_list, valid_flag_list = self.get_anchors(
-            featmap_sizes, img_metas, device=device)
         cls_reg_targets = self.get_targets(
             anchor_list,
             valid_flag_list,
@@ -444,21 +427,12 @@ class PRSHead(AnchorHead):
             s.permute(0, 2, 3, 1).reshape(
                 num_images, -1, self.cls_out_channels) for s in cls_scores
         ], 1)
-        all_cls_scores_new = torch.cat([
-            s.permute(0, 2, 3, 1).reshape(
-                num_images, -1, self.cls_out_channels) for s in cls_scores_new
-        ], 1)
         all_labels = torch.cat(labels_list, -1).view(num_images, -1)
         all_label_weights = torch.cat(label_weights_list,
                                       -1).view(num_images, -1)
         all_bbox_preds = torch.cat([
             b.permute(0, 2, 3, 1).reshape(num_images, -1, 4)
             for b in bbox_preds
-        ], -2)
-        # [stage, bs, anchors*4, h, w] -> [bs, stage*h*w*anchors, 4]
-        all_bbox_preds_new = torch.cat([
-            b.permute(0, 2, 3, 1).reshape(num_images, -1, 4)
-            for b in bbox_preds_new
         ], -2)
         all_bbox_targets = torch.cat(bbox_targets_list,
                                      -2).view(num_images, -1, 4)
@@ -476,9 +450,13 @@ class PRSHead(AnchorHead):
         assert torch.isfinite(all_bbox_preds).all().item(), \
             'bbox predications become infinite or NaN!'
 
+        fg_labels = all_labels.clone().float()
+        fg_labels[fg_labels != self.num_classes] = 1
+        fg_labels[fg_labels == self.num_classes] = 0
 
-        losses_cls, losses_bbox = multi_apply(
-            self.loss_single,
+
+        losses_cls, losses_bbox_ref = multi_apply(
+            self.loss_single_post,
             all_cls_scores,
             all_bbox_preds,
             all_anchors,
@@ -487,73 +465,163 @@ class PRSHead(AnchorHead):
             all_bbox_targets,
             all_bbox_weights,
             num_total_samples=num_total_pos)
+        return dict(loss_cls=losses_cls, losses_bbox_ref=losses_bbox_ref)
 
-        losses_cls2, losses_bbox2 = multi_apply(
-            self.loss_single,
-            all_cls_scores_new,
-            all_bbox_preds_new,
-            all_anchors,
-            all_labels,
-            all_label_weights,
-            all_bbox_targets,
-            all_bbox_weights,
-            num_total_samples=num_total_pos)
-        return dict(loss_cls=losses_cls, losses_cls2=losses_cls2, loss_bbox=losses_bbox, losses_bbox2=losses_bbox2)
+    def anchor_offset(self, anchor_list, anchor_strides, featmap_sizes):
+        def _shape_offset(anchors, stride, ks=3, dilation=1):
+            # currently support kernel_size=3 and dilation=1
+            assert ks == 3 and dilation == 1
+            pad = (ks - 1) // 2
+            idx = torch.arange(-pad, pad + 1, dtype=dtype, device=device)
+            yy, xx = torch.meshgrid(idx, idx)  # return order matters
+            xx = xx.reshape(-1)
+            yy = yy.reshape(-1)
+            w = (anchors[:, 2] - anchors[:, 0]) / stride
+            h = (anchors[:, 3] - anchors[:, 1]) / stride
+            w = w / (ks - 1) - dilation
+            h = h / (ks - 1) - dilation
+            offset_x = w[:, None] * xx  # (NA, ks**2)
+            offset_y = h[:, None] * yy  # (NA, ks**2)
+            return offset_x, offset_y
+
+        def _ctr_offset(anchors, stride, featmap_size, num_anchors):
+            feat_h, feat_w = featmap_size
+
+            x = (anchors[:, 0] + anchors[:, 2]) * 0.5
+            y = (anchors[:, 1] + anchors[:, 3]) * 0.5
+            # compute centers on feature map
+            x = x / stride
+            y = y / stride
+            # compute predefine centers
+            xx = torch.arange(0, feat_w, device=anchors.device)
+            yy = torch.arange(0, feat_h, device=anchors.device)
+            yy, xx = torch.meshgrid(yy, xx)
+            xx = xx.reshape(-1).type_as(x)
+            yy = yy.reshape(-1).type_as(y)
+
+            xx = xx.unsqueeze(1).expand(xx.shape+(num_anchors,)).reshape(-1)
+            yy = yy.unsqueeze(1).expand(yy.shape+(num_anchors,)).reshape(-1)
+
+            offset_x = x - xx  # (NA, )
+            offset_y = y - yy  # (NA, )
+            return offset_x, offset_y
+
+        num_imgs = len(anchor_list)
+        num_lvls = len(anchor_list[0])
+        dtype = anchor_list[0][0].dtype
+        device = anchor_list[0][0].device
+        num_level_anchors = [anchors.size(0) for anchors in anchor_list[0]]
+
+        offset_list = []
+        for i in range(num_imgs):
+            mlvl_offset = []
+            for lvl in range(num_lvls):
+                c_offset_x, c_offset_y = _ctr_offset(anchor_list[i][lvl],
+                                                     anchor_strides[lvl],
+                                                     featmap_sizes[lvl],
+                                                     self.num_anchors[lvl])
+                s_offset_x, s_offset_y = _shape_offset(anchor_list[i][lvl],
+                                                       anchor_strides[lvl])
+
+                # offset = ctr_offset + shape_offset
+                offset_x = s_offset_x + c_offset_x[:, None]
+                offset_y = s_offset_y + c_offset_y[:, None]
+
+                # offset order (y0, x0, y1, x2, .., y8, x8, y9, x9)
+                offset = torch.stack([offset_y, offset_x], dim=-1)
+                offset = offset.reshape(offset.size(0), -1)  # [NA, 2*ks**2]
+                mlvl_offset.append(offset)
+            offset_list.append(torch.cat(mlvl_offset))  # [totalNA, 2*ks**2]
+        offset_list = images_to_levels(offset_list, num_level_anchors)
+        return offset_list
+
+    def refine_bboxes(self, anchor_list, bbox_preds, img_metas):
+        """Refine bboxes through stages."""
+        num_levels = len(bbox_preds)
+        new_anchor_list = []
+        for img_id in range(len(img_metas)):
+            mlvl_anchors = []
+            for i in range(num_levels):
+                bbox_pred = bbox_preds[i][img_id].detach()
+                bbox_pred = bbox_pred.permute(1, 2, 0).reshape(-1, 4)
+                img_shape = img_metas[img_id]['img_shape']
+                bboxes = self.bbox_coder.decode(anchor_list[img_id][i],
+                                                bbox_pred, img_shape)
+                mlvl_anchors.append(bboxes)
+            new_anchor_list.append(mlvl_anchors)
+        return new_anchor_list
+
+    def simple_test_bboxes(self, feats, img_metas, rescale=False):
+        fg_scores, bbox_preds = self(feats)
+
+        featmap_sizes = [featmap.size()[-2:] for featmap in fg_scores]
+        assert len(featmap_sizes) == self.anchor_generator.num_levels
+
+        device = fg_scores[0].device
+        anchor_list, valid_flag_list = self.get_anchors(
+            featmap_sizes, img_metas, device=device)
+
+        new_feats = []
+
+        # pre-processing
+        # for i in range(len(cls_scores)):
+        #     score = fg_scores[i]
+        #     s,_ = torch.max(score, dim = 1)
+        #     s = s.unsqueeze(1)
+        #     s = F.sigmoid(s)
+        #     new_feats.append(s*feats[i]+feats[i])
+        new_feats = feats
+
+        anchor_list_refine = self.refine_bboxes(anchor_list, bbox_preds, img_metas)
+        offset_list = self.anchor_offset(anchor_list_refine, self.anchor_strides, featmap_sizes)
+        cls_scores, bbox_preds_refine = self.forward_post(new_feats, offset_list)
+        results_list = self.get_bboxes(anchor_list_refine[0], cls_scores, bbox_preds_refine, img_metas, rescale=rescale)
+        return results_list
 
     @force_fp32(apply_to=('cls_scores', 'bbox_preds'))
-    def get_bboxes(self,cls_scores,
+    def get_bboxes(self,
+                   anchor_list,
+                   cls_scores,
                    bbox_preds,
                    img_metas,
                    cfg=None,
-                   rescale=False):
-        # cls_scores_new, cls_scores = cls_scores
-        # bbox_preds_new, bbox_preds = bbox_preds
-        cls_scores, cls_scores_old = cls_scores
-        bbox_preds, bbox_preds_old = bbox_preds
+                   rescale=False,
+                   with_nms=True):
+
         assert len(cls_scores) == len(bbox_preds)
         num_levels = len(cls_scores)
 
-        device = cls_scores[0].device
-        featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
-        mlvl_anchors = self.anchor_generator.grid_anchors(
-            featmap_sizes, device=device)
+        # device = cls_scores[0].device
+        # featmap_sizes = [cls_scores[i].shape[-2:] for i in range(num_levels)]
+        # mlvl_anchors2 = self.anchor_generator.grid_anchors(
+        #     featmap_sizes, device=device)
+        # anchor_list = images_to_levels(anchor_list, num_levels)
+        mlvl_anchors = [anchor_list[i].detach() for i in range(num_levels)]
+        mlvl_cls_scores = [cls_scores[i].detach() for i in range(num_levels)]
+        mlvl_bbox_preds = [bbox_preds[i].detach() for i in range(num_levels)]
 
-        result_list = []
-        for img_id in range(len(img_metas)):
-            cls_score_list = [
-                cls_scores[i][img_id].detach() for i in range(num_levels)
+        if torch.onnx.is_in_onnx_export():
+            assert len(
+                img_metas
+            ) == 1, 'Only support one input image while in exporting to ONNX'
+            img_shapes = img_metas[0]['img_shape_for_onnx']
+        else:
+            img_shapes = [
+                img_metas[i]['img_shape']
+                for i in range(cls_scores[0].shape[0])
             ]
-            bbox_pred_list = [
-                bbox_preds[i][img_id].detach() for i in range(num_levels)
-            ]
-            img_shape = img_metas[img_id]['img_shape']
-            scale_factor = img_metas[img_id]['scale_factor']
-            proposals = self._get_bboxes_single(cls_score_list, bbox_pred_list,
-                                                mlvl_anchors, img_shape,
-                                                scale_factor, cfg, rescale)
-            result_list.append(proposals)
+        scale_factors = [
+            img_metas[i]['scale_factor'] for i in range(cls_scores[0].shape[0])
+        ]
+
+        if with_nms:
+            # some heads don't support with_nms argument
+            result_list = self._get_bboxes(mlvl_cls_scores, mlvl_bbox_preds,
+                                           mlvl_anchors, img_shapes,
+                                           scale_factors, cfg, rescale)
+        else:
+            result_list = self._get_bboxes(mlvl_cls_scores, mlvl_bbox_preds,
+                                           mlvl_anchors, img_shapes,
+                                           scale_factors, cfg, rescale,
+                                           with_nms)
         return result_list
-
-
-def pad_to_square(img, pad_value):
-    c, h, w = img.shape
-    dim_diff = np.abs(h - w)
-    # (upper / left) padding and (lower / right) padding
-    pad1, pad2 = dim_diff // 2, dim_diff - dim_diff // 2
-    # Determine padding
-    pad = (0, 0, pad1, pad2) if h <= w else (pad1, pad2, 0, 0)
-    # Add padding
-    img = F.pad(img, pad, "constant", value=pad_value)
-
-    return img, pad
-
-def xywh2xyxy(box):
-    x = box[0]
-    y = box[1]
-    w = box[2]
-    h = box[3]
-    x1 = int(x - w//2)
-    x2 = int(x + w//2)
-    y1 = int(y - h//2)
-    y2 = int(y + h//2)
-    return [x1,y1,x2,y2]

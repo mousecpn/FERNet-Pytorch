@@ -2,6 +2,12 @@
 
 [This is the unofficial implementation of Dual Refinement Underwater Object Detection Network](https://link.springer.com/chapter/10.1007/978-3-030-58565-5_17) (ECCV2020).
 
+### 2022/04/15 Update
+
+1. Compatible with the current version of MMDetection.
+2. Borrow code from Cascade-RPN (Adaptive Conv) to implement the refinement stage. In detail, we use one share Adaptive Conv and two separate cls conv and reg conv to obtain the final class prediction and bbox.
+3. The performance of FERNet300 can surpass the SSD300. 
+
 ### SETUP
 
 This implementation is based on [mmdetection](https://github.com/open-mmlab/mmdetection).
