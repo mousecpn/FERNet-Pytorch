@@ -2,6 +2,8 @@
 
 [This is the unofficial implementation of Dual Refinement Underwater Object Detection Network](https://link.springer.com/chapter/10.1007/978-3-030-58565-5_17) (ECCV2020).
 
+The official repo disappeared.... Probably another fake paper....
+
 ### 2022/04/15 Update
 
 1. Compatible with the current version of MMDetection.
